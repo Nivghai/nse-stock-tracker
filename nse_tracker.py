@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
 """
-NSE daily / weekly mover tracker.
-
-Run once after market close (after ~4:00 PM IST):
-    python nse_tracker.py
-
-It will
-  1. download the list of all NSE equities + index constituents,
-  2. download recent closing prices (Yahoo Finance) into a local SQLite DB (nse.db),
-  3. compute day % and week % change for every stock and index,
-  4. write report.html (open it in any browser).
-
-Options:
-    python nse_tracker.py --no-fetch      rebuild report from the DB only
-    python nse_tracker.py --period 3mo    pull a longer price history
+NSE daily / weekly mover tracker - Streamlit Edition.
 """
 import argparse
 import datetime as dt
@@ -26,6 +13,11 @@ from pathlib import Path
 import pandas as pd
 import requests
 import yfinance as yf
+import streamlit as st
+import streamlit.components.v1 as components
+
+# --- Page Setup ---
+st.set_page_config(page_title="NSE Stock Tracker", layout="wide", page_icon="📈")
 
 HERE = Path(__file__).resolve().parent
 DB_PATH = HERE / "nse.db"
@@ -41,7 +33,6 @@ HEADERS = {
 EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 INDEX_LIST_BASE = "https://nsearchives.nseindia.com/content/indices/"
 
-# Index name -> constituent CSV published by NSE
 INDEX_FILES = {
     "Nifty 50": "ind_nifty50list.csv",
     "Nifty Next 50": "ind_niftynext50list.csv",
@@ -61,9 +52,6 @@ INDEX_FILES = {
     "Nifty Realty": "ind_niftyrealtylist.csv",
 }
 
-# Index name -> Yahoo Finance ticker for the index level itself.
-# Any ticker Yahoo doesn't return is skipped; the index still appears
-# in the report with its constituent counts.
 INDEX_TICKERS = {
     "Nifty 50": "^NSEI",
     "Nifty Next 50": "^NSMIDCP",
@@ -78,9 +66,7 @@ INDEX_TICKERS = {
     "Nifty Realty": "^CNXREALTY",
 }
 
-
-# ----------------------------------------------------------------- database
-
+# ----------------------------------------------------------------- Database
 VIEWS = """
 DROP VIEW IF EXISTS daily_movers;
 CREATE VIEW daily_movers AS
@@ -140,9 +126,9 @@ def refresh_lists(con):
         eq = eq[eq["SERIES"].astype(str).str.strip() == "EQ"]
         rows = [(s.strip(), n.strip()) for s, n in zip(eq["SYMBOL"], eq["NAME OF COMPANY"])]
         con.executemany("INSERT OR REPLACE INTO stocks VALUES (?,?)", rows)
-        print(f"  {len(rows)} NSE equities")
+        st.write(f"✅ {len(rows)} NSE equities processed")
     except Exception as e:
-        print(f"  ! could not refresh equity list ({e}); using what is in the DB")
+        st.warning(f"Could not refresh equity list ({e}); using local DB copy.")
 
     for index_name, fname in INDEX_FILES.items():
         try:
@@ -151,28 +137,27 @@ def refresh_lists(con):
             con.execute("DELETE FROM constituents WHERE index_name=?", (index_name,))
             con.executemany("INSERT OR REPLACE INTO constituents VALUES (?,?)",
                             [(index_name, s) for s in syms])
-            # make sure constituents exist in the stock table even if not in EQUITY_L
             if "Company Name" in df.columns:
                 con.executemany("INSERT OR IGNORE INTO stocks VALUES (?,?)",
                                 [(s.strip(), n.strip()) for s, n in zip(df["Symbol"], df["Company Name"])])
-            print(f"  {index_name}: {len(syms)} constituents")
         except Exception as e:
-            print(f"  ! {index_name}: skipped ({e})")
+            pass
     con.commit()
 
 
-# -------------------------------------------------------------------- prices
+# -------------------------------------------------------------------- Prices
 def download_closes(ticker_map, period):
-    """ticker_map: {yahoo_ticker: db_symbol}. Returns long DataFrame."""
     tickers = list(ticker_map)
     frames = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
     for i in range(0, len(tickers), 150):
         chunk = tickers[i:i + 150]
         try:
             df = yf.download(chunk, period=period, interval="1d", auto_adjust=False,
                              progress=False, threads=True)
-        except Exception as e:
-            print(f"  ! batch {i // 150 + 1} failed: {e}")
+        except Exception:
             continue
         if df is None or df.empty:
             continue
@@ -186,7 +171,14 @@ def download_closes(ticker_map, period):
         close.index.name = "date"
         long = close.reset_index().melt(id_vars="date", var_name="ticker", value_name="close")
         frames.append(long.dropna())
-        print(f"  prices: {min(i + 150, len(tickers))}/{len(tickers)}")
+        
+        pct = min(i + 150, len(tickers)) / len(tickers)
+        progress_bar.progress(pct)
+        status_text.text(f"Downloaded prices for {min(i + 150, len(tickers))}/{len(tickers)} symbols...")
+        
+    progress_bar.empty()
+    status_text.empty()
+    
     if not frames:
         return pd.DataFrame(columns=["date", "symbol", "close"])
     out = pd.concat(frames)
@@ -200,24 +192,24 @@ def refresh_prices(con, period):
     ticker_map.update({t: t for t in INDEX_TICKERS.values()})
     long = download_closes(ticker_map, period)
     if long.empty:
-        print("  ! no prices downloaded")
+        st.error("No prices downloaded.")
         return
     con.executemany(
         "INSERT OR REPLACE INTO prices VALUES (?,?,?)",
         [(r.symbol, r.date.strftime("%Y-%m-%d"), float(r.close)) for r in long.itertuples()],
     )
     con.commit()
-    print(f"  stored {len(long)} price rows")
+    st.success(f"Stored {len(long)} price records in database.")
 
 
-# ------------------------------------------------------------------ compute
+# ------------------------------------------------------------------ Compute
 def compute(con):
     px = pd.read_sql(
         "SELECT date, symbol, close FROM prices "
         "WHERE date >= date((SELECT MAX(date) FROM prices), '-40 day')",
         con, parse_dates=["date"])
     if px.empty:
-        sys.exit("No prices in the database yet. Run without --no-fetch first.")
+        return None, None, None
     wide = px.pivot(index="date", columns="symbol", values="close").sort_index()
 
     latest = wide.index[-1]
@@ -230,7 +222,7 @@ def compute(con):
     res = pd.DataFrame({"c": last})
     res["d"] = (last / prev - 1) * 100
     res["w"] = (last / base.reindex(last.index) - 1) * 100
-    res = res.dropna(subset=["c"])  # not traded on the latest date -> excluded
+    res = res.dropna(subset=["c"])
     return res, latest, before_week.index[-1] if len(before_week) else None
 
 
@@ -240,6 +232,8 @@ def num(x):
 
 def build_payload(con):
     res, latest, week_base_date = compute(con)
+    if res is None:
+        return None
 
     names = dict(con.execute("SELECT symbol, name FROM stocks"))
     members = {}
@@ -273,26 +267,19 @@ def build_payload(con):
 
 
 def write_report(payload):
+    if not payload or not TEMPLATE_PATH.exists():
+        return
     html = TEMPLATE_PATH.read_text(encoding="utf-8")
     data = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     REPORT_PATH.write_text(html.replace("__DATA__", data), encoding="utf-8")
-    print(f"\nReport written: {REPORT_PATH}")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--no-fetch", action="store_true", help="skip downloads, rebuild report only")
-    ap.add_argument("--period", default="1mo", help="price history to pull (yfinance period, default 1mo)")
-    args = ap.parse_args()
+# ------------------------------------------------------------------ Streamlit Web Interface
+def run_app():
+    st.title("📈 NSE Stock & Index Mover Tracker")
+    st.markdown("Track daily and weekly movers across all NSE equities and indices.")
 
     con = connect()
-    if not args.no_fetch:
-        print("Refreshing NSE stock and index lists...")
-        refresh_lists(con)
-        print("Downloading prices...")
-        refresh_prices(con, args.period)
-    write_report(build_payload(con))
 
-
-if __name__ == "__main__":
-    main()
+    # Sidebar Controls
+    st.sidebar.header
