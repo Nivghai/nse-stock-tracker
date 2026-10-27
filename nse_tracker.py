@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NSE daily / weekly mover tracker - Streamlit Edition.
+NSE daily / weekly mover tracker - Complete Streamlit Cloud Edition.
 """
 import argparse
 import datetime as dt
@@ -16,7 +16,7 @@ import yfinance as yf
 import streamlit as st
 import streamlit.components.v1 as components
 
-# --- Page Setup ---
+# --- Streamlit Page Configuration ---
 st.set_page_config(page_title="NSE Stock Tracker", layout="wide", page_icon="📈")
 
 HERE = Path(__file__).resolve().parent
@@ -66,7 +66,7 @@ INDEX_TICKERS = {
     "Nifty Realty": "^CNXREALTY",
 }
 
-# ----------------------------------------------------------------- Database
+# ----------------------------------------------------------------- Database Initialization
 VIEWS = """
 DROP VIEW IF EXISTS daily_movers;
 CREATE VIEW daily_movers AS
@@ -111,7 +111,7 @@ def connect():
     return con
 
 
-# ----------------------------------------------------------------- NSE lists
+# ----------------------------------------------------------------- NSE Stock & Index Fetching
 def get_csv(url):
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
@@ -126,9 +126,9 @@ def refresh_lists(con):
         eq = eq[eq["SERIES"].astype(str).str.strip() == "EQ"]
         rows = [(s.strip(), n.strip()) for s, n in zip(eq["SYMBOL"], eq["NAME OF COMPANY"])]
         con.executemany("INSERT OR REPLACE INTO stocks VALUES (?,?)", rows)
-        st.write(f"✅ {len(rows)} NSE equities processed")
+        st.write(f"✅ Downloaded {len(rows)} NSE stock symbols")
     except Exception as e:
-        st.warning(f"Could not refresh equity list ({e}); using local DB copy.")
+        st.warning(f"Could not refresh equity list ({e}); using existing DB records.")
 
     for index_name, fname in INDEX_FILES.items():
         try:
@@ -140,12 +140,12 @@ def refresh_lists(con):
             if "Company Name" in df.columns:
                 con.executemany("INSERT OR IGNORE INTO stocks VALUES (?,?)",
                                 [(s.strip(), n.strip()) for s, n in zip(df["Symbol"], df["Company Name"])])
-        except Exception as e:
+        except Exception:
             pass
     con.commit()
 
 
-# -------------------------------------------------------------------- Prices
+# -------------------------------------------------------------------- Price History Downloads
 def download_closes(ticker_map, period):
     tickers = list(ticker_map)
     frames = []
@@ -174,7 +174,7 @@ def download_closes(ticker_map, period):
         
         pct = min(i + 150, len(tickers)) / len(tickers)
         progress_bar.progress(pct)
-        status_text.text(f"Downloaded prices for {min(i + 150, len(tickers))}/{len(tickers)} symbols...")
+        status_text.text(f"Downloading prices: {min(i + 150, len(tickers))}/{len(tickers)} symbols...")
         
     progress_bar.empty()
     status_text.empty()
@@ -192,17 +192,17 @@ def refresh_prices(con, period):
     ticker_map.update({t: t for t in INDEX_TICKERS.values()})
     long = download_closes(ticker_map, period)
     if long.empty:
-        st.error("No prices downloaded.")
+        st.error("No prices returned from Yahoo Finance.")
         return
     con.executemany(
         "INSERT OR REPLACE INTO prices VALUES (?,?,?)",
         [(r.symbol, r.date.strftime("%Y-%m-%d"), float(r.close)) for r in long.itertuples()],
     )
     con.commit()
-    st.success(f"Stored {len(long)} price records in database.")
+    st.success(f"Stored {len(long)} price rows in database.")
 
 
-# ------------------------------------------------------------------ Compute
+# ------------------------------------------------------------------ Market Calculations
 def compute(con):
     px = pd.read_sql(
         "SELECT date, symbol, close FROM prices "
@@ -274,12 +274,77 @@ def write_report(payload):
     REPORT_PATH.write_text(html.replace("__DATA__", data), encoding="utf-8")
 
 
-# ------------------------------------------------------------------ Streamlit Web Interface
+# ------------------------------------------------------------------ Main UI Application
 def run_app():
     st.title("📈 NSE Stock & Index Mover Tracker")
     st.markdown("Track daily and weekly movers across all NSE equities and indices.")
 
     con = connect()
 
-    # Sidebar Controls
-    st.sidebar.header
+    # Main Page Refresh Controls
+    col_select, col_btn = st.columns([1, 2])
+    with col_select:
+        period = st.selectbox("Price History Fetch Period", ["1mo", "3mo", "6mo"], index=0)
+    with col_btn:
+        st.write("")
+        st.write("")
+        if st.button("🔄 Fetch Latest Market Data", type="primary", use_container_width=True):
+            with st.spinner("Fetching stock list and downloading daily prices..."):
+                refresh_lists(con)
+                refresh_prices(con, period)
+                payload = build_payload(con)
+                write_report(payload)
+                st.success("Market Data Updated Successfully!")
+                st.rerun()
+
+    st.divider()
+
+    # Dashboard Tabs
+    tab1, tab2, tab3 = st.tabs(["📊 Interactive Views", "📰 HTML Report View", "ℹ️ Database Summary"])
+
+    with tab1:
+        try:
+            df_daily = pd.read_sql("SELECT * FROM daily_movers", con)
+            df_weekly = pd.read_sql("SELECT * FROM weekly_movers", con)
+
+            st.subheader("Top Daily Movers")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Top Gainers Today (%)**")
+                st.dataframe(df_daily.sort_values(by="day_change_pct", ascending=False).head(15), use_container_width=True)
+            with col2:
+                st.markdown("**Top Losers Today (%)**")
+                st.dataframe(df_daily.sort_values(by="day_change_pct", ascending=True).head(15), use_container_width=True)
+
+            st.divider()
+
+            st.subheader("Top Weekly Movers")
+            col3, col4 = st.columns(2)
+            with col3:
+                st.markdown("**Top Gainers This Week (%)**")
+                st.dataframe(df_weekly.sort_values(by="week_change_pct", ascending=False).head(15), use_container_width=True)
+            with col4:
+                st.markdown("**Top Losers This Week (%)**")
+                st.dataframe(df_weekly.sort_values(by="week_change_pct", ascending=True).head(15), use_container_width=True)
+
+        except Exception:
+            st.info("No market data found in database. Click **'🔄 Fetch Latest Market Data'** above to populate data.")
+
+    with tab2:
+        if REPORT_PATH.exists():
+            report_html = REPORT_PATH.read_text(encoding="utf-8")
+            components.html(report_html, height=800, scrolling=True)
+        else:
+            st.info("HTML Report not generated yet. Click 'Fetch Latest Market Data' first.")
+
+    with tab3:
+        try:
+            total_stocks = con.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]
+            total_prices = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+            st.metric("Tracked Equities", total_stocks)
+            st.metric("Total Price Rows in DB", total_prices)
+        except Exception:
+            st.write("Database is uninitialized.")
+
+if __name__ == "__main__":
+    run_app()
