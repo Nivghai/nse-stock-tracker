@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NSE movers</title>
+<style>
+  :root {
+    --bg: #f2f4f6; --panel: #ffffff; --ink: #121c26; --muted: #5d6b79; --line: #dde2e7;
+    --up: #0b8a4d; --down: #c4332a; --band: #e3f5ea; --accent: #1b4f72; --focus: #1b6ca8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e141a; --panel: #151d25; --ink: #e6ebf0; --muted: #8b9aa8; --line: #26323d;
+      --up: #3ccf86; --down: #ff6b60; --band: #12301f; --accent: #8cc4ec; --focus: #6bb3e6;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--ink); }
+  body { margin: 0; padding: 20px clamp(12px, 3vw, 32px) 48px; max-width: 1280px; margin-inline: auto; }
+  .num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 24px; margin-bottom: 16px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  .asof { color: var(--muted); font-size: 14px; }
+  .asof b { color: var(--ink); font-weight: 600; }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: end; background: var(--panel);
+              border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; }
+  .field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+  input, select, button { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+                          border-radius: 6px; padding: 7px 9px; }
+  input[type=number] { width: 76px; }
+  input[type=search] { width: 190px; }
+  select { max-width: 200px; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; background: transparent; padding: 7px 18px; cursor: pointer; font-weight: 600; }
+  .seg button[aria-pressed=true] { background: var(--accent); color: var(--panel); }
+  .presets { display: flex; gap: 6px; }
+  .presets button { cursor: pointer; padding: 7px 10px; }
+
+  main { display: grid; grid-template-columns: 330px 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  section h2 { font-size: 15px; margin: 0; padding: 12px 14px; border-bottom: 1px solid var(--line); display: flex;
+               justify-content: space-between; align-items: baseline; }
+  section h2 span { font-weight: 400; color: var(--muted); font-size: 13px; }
+  .scroll { overflow: auto; max-height: 76vh; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 8px 12px; border-bottom: 1px solid var(--line); text-align: left; }
+  th { position: sticky; top: 0; background: var(--panel); font-weight: 600; font-size: 13px; color: var(--muted); z-index: 1; }
+  th.num, td.num { text-align: right; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .up { color: var(--up); } .down { color: var(--down); }
+  .chg { font-weight: 600; }
+  #idx tbody tr { cursor: pointer; }
+  #idx tbody tr:hover, #idx tbody tr.sel { background: var(--bg); }
+  #idx tbody tr.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+  .hits { font-weight: 600; }
+  .hits.zero { color: var(--muted); font-weight: 400; }
+  #stocks tbody tr.hit td:nth-child(4) { background: var(--band); }
+  .sym { font-weight: 600; }
+  .co { color: var(--muted); font-size: 13px; }
+  .tags { color: var(--muted); font-size: 12px; max-width: 280px; }
+  .empty { padding: 28px 14px; color: var(--muted); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 14px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NSE movers</h1>
+  <div class="asof" id="asof"></div>
+</header>
+
+<div class="controls">
+  <div class="field">View
+    <div class="seg" role="group" aria-label="Period">
+      <button id="pd" aria-pressed="true">Day</button>
+      <button id="pw" aria-pressed="false">Week</button>
+    </div>
+  </div>
+  <div class="field"><label for="lo">Gain from (%)</label><input id="lo" type="number" step="0.1" value="3"></div>
+  <div class="field"><label for="hi">to (%), blank = no limit</label><input id="hi" type="number" step="0.1" value="4"></div>
+  <div class="field">Quick range
+    <div class="presets">
+      <button data-lo="3" data-hi="4">3–4%</button>
+      <button data-lo="3" data-hi="">3% and above</button>
+      <button data-lo="5" data-hi="">5% and above</button>
+    </div>
+  </div>
+  <div class="field"><label for="ix">Index</label><select id="ix"></select></div>
+  <div class="field"><label for="q">Search</label><input id="q" type="search" placeholder="Symbol or company"></div>
+</div>
+
+<main>
+  <section>
+    <h2>Indices <span id="idxhint"></span></h2>
+    <div class="scroll">
+      <table id="idx">
+        <thead><tr><th>Index</th><th class="num" id="idxchg">Day</th><th class="num">In range</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+  <section>
+    <h2><span style="color:var(--ink);font-size:15px;font-weight:600" id="title">Stocks</span><span id="count"></span></h2>
+    <div class="scroll">
+      <table id="stocks">
+        <thead><tr><th>Symbol</th><th class="num">Close</th><th class="num">Day</th><th class="num">Week</th><th>Indices</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="empty" hidden></div>
+    </div>
+  </section>
+</main>
+
+<p class="note" id="note"></p>
+
+<script>
+const D = __DATA__;
+const $ = id => document.getElementById(id);
+let period = "d";
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const pct = x => x == null ? "–" : (x > 0 ? "+" : "") + x.toFixed(2) + "%";
+const cls = x => x == null ? "" : x > 0 ? "up" : x < 0 ? "down" : "";
+const label = () => period === "d" ? "Day" : "Week";
+
+function range() {
+  const lo = $("lo").value === "" ? -Infinity : parseFloat($("lo").value);
+  const hi = $("hi").value === "" ? Infinity : parseFloat($("hi").value);
+  return [lo, hi];
+}
+const inRange = (v, lo, hi) => v != null && v >= lo && v <= hi;
+
+function init() {
+  $("asof").innerHTML = `Latest close <b>${esc(D.asof)}</b>`;
+  const sel = $("ix");
+  sel.innerHTML = `<option value="">All NSE stocks</option>` +
+    D.indices.map(i => `<option value="${esc(i.n)}">${esc(i.n)} (${i.m})</option>`).join("");
+  $("note").textContent =
+    `Day change compares the latest close with the previous trading day's close. ` +
+    `Week change compares it with the last close before this week started` +
+    (D.weekBase ? ` (${D.weekBase})` : "") +
+    `, so on a Friday it is the full week and mid-week it is week-to-date. ` +
+    `Prices via Yahoo Finance; stocks that did not trade on the latest date are left out. Report built ${D.generated}.`;
+  render();
+}
+
+function render() {
+  const [lo, hi] = range();
+  const ix = $("ix").value, q = $("q").value.trim().toLowerCase();
+
+  // --- indices panel
+  $("idxchg").textContent = label();
+  $("idxhint").textContent = "click to filter";
+  const hitsByIndex = {};
+  for (const s of D.stocks) if (inRange(s[period], lo, hi)) for (const n of s.ix) hitsByIndex[n] = (hitsByIndex[n] || 0) + 1;
+  $("idx").tBodies[0].innerHTML = D.indices.map(i => {
+    const h = hitsByIndex[i.n] || 0;
+    return `<tr data-ix="${esc(i.n)}" class="${i.n === ix ? "sel" : ""}">
+      <td>${esc(i.n)}</td>
+      <td class="num chg ${cls(i[period])}">${pct(i[period])}</td>
+      <td class="num hits ${h ? "" : "zero"}">${h} / ${i.m}</td></tr>`;
+  }).join("");
+
+  // --- stocks panel
+  let rows = D.stocks.filter(s => inRange(s[period], lo, hi));
+  if (ix) rows = rows.filter(s => s.ix.includes(ix));
+  if (q) rows = rows.filter(s => s.s.toLowerCase().includes(q) || s.n.toLowerCase().includes(q));
+  rows.sort((a, b) => b[period] - a[period]);
+
+  const rangeText = (isFinite(lo) ? lo + "%" : "any") + (isFinite(hi) ? " to " + hi + "%" : " and above");
+  $("title").textContent = `${label()} gainers, ${rangeText}`;
+  $("count").textContent = `${rows.length} stock${rows.length === 1 ? "" : "s"}` + (ix ? ` in ${ix}` : "");
+  $("stocks").tBodies[0].innerHTML = rows.map(s => `<tr class="hit">
+      <td><div class="sym">${esc(s.s)}</div><div class="co">${esc(s.n)}</div></td>
+      <td class="num">${s.c.toFixed(2)}</td>
+      <td class="num chg ${cls(s.d)}">${pct(s.d)}</td>
+      <td class="num chg ${cls(s.w)}">${pct(s.w)}</td>
+      <td class="tags">${esc(s.ix.join(", "))}</td></tr>`).join("");
+  const empty = $("empty");
+  empty.hidden = rows.length > 0;
+  empty.textContent = "No stocks match this range. Widen the range or clear the index filter.";
+}
+
+function setPeriod(p) {
+  period = p;
+  $("pd").setAttribute("aria-pressed", p === "d");
+  $("pw").setAttribute("aria-pressed", p === "w");
+  render();
+}
+$("pd").onclick = () => setPeriod("d");
+$("pw").onclick = () => setPeriod("w");
+["lo", "hi", "q"].forEach(id => $(id).addEventListener("input", render));
+$("ix").addEventListener("change", render);
+document.querySelectorAll(".presets button").forEach(b => b.onclick = () => {
+  $("lo").value = b.dataset.lo; $("hi").value = b.dataset.hi; render();
+});
+$("idx").tBodies[0].addEventListener("click", e => {
+  const tr = e.target.closest("tr"); if (!tr) return;
+  $("ix").value = $("ix").value === tr.dataset.ix ? "" : tr.dataset.ix; render();
+});
+init();
+</script>
+</body>
+</html>
