@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NSE Stock & Global Macro Dashboard - Pure NSE Scraper Edition (No yfinance).
+NSE Stock & Global Macro Dashboard - Streamlit Cloud Edition.
 """
 import io
 import json
@@ -11,12 +11,14 @@ from pathlib import Path
 import pandas as pd
 import requests
 import streamlit as st
-from nsepython import (
-    nse_get_all_indices,
-    index_pe_pb,
-    equity_history,
-    nsefetch
-)
+
+# Safe import for nsepython
+NSEPYTHON_AVAILABLE = False
+try:
+    from nsepython import nse_get_all_indices, index_pe_pb, nsefetch
+    NSEPYTHON_AVAILABLE = True
+except Exception:
+    NSEPYTHON_AVAILABLE = False
 
 # --- Page Setup ---
 st.set_page_config(page_title="Pure NSE Market Dashboard", layout="wide", page_icon="📈")
@@ -29,8 +31,6 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/csv,*/*",
 }
-
-EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
 INDEX_TICKERS = {
     "Nifty 50": "NIFTY 50",
@@ -87,66 +87,29 @@ def connect():
     con.executescript(VIEWS)
     return con
 
-# ----------------------------------------------------------------- Pure NSE Stock Scraper
-def fetch_nse_stock_history(symbol, days=30):
-    """Fetches price history directly from NSE India REST endpoint using nsepython."""
-    end_date = dt.date.today().strftime("%d-%m-%Y")
-    start_date = (dt.date.today() - dt.timedelta(days=days)).strftime("%d-%m-%Y")
-    try:
-        df = equity_history(symbol, "EQ", start_date, end_date)
-        if df is not None and not df.empty:
-            df = df[['CH_TIMESTAMP', 'CH_CLOSING_PRICE']].copy()
-            df.columns = ['date', 'close']
-            df['symbol'] = symbol
-            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-            return df
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-def refresh_nse_prices(con):
-    """Scrapes latest closing prices directly from NSE for all tracked stocks."""
-    stock_syms = [r[0] for r in con.execute("SELECT symbol FROM stocks LIMIT 50")]
-    p_bar = st.progress(0)
-    status = st.empty()
-    
-    total_records = 0
-    for idx, sym in enumerate(stock_syms):
-        df_hist = fetch_nse_stock_history(sym)
-        if not df_hist.empty:
-            con.executemany(
-                "INSERT OR REPLACE INTO prices VALUES (?,?,?)",
-                [(r.symbol, r.date, float(r.close)) for r in df_hist.itertuples()]
-            )
-            total_records += len(df_hist)
-        p_bar.progress((idx + 1) / len(stock_syms))
-        status.text(f"Scraped NSE prices for: {sym} ({idx+1}/{len(stock_syms)})")
-    
-    con.commit()
-    p_bar.empty()
-    status.empty()
-    st.success(f"Successfully stored {total_records} price points directly from NSE!")
-
 # ----------------------------------------------------------------- Live Index Valuation Scraper
 @st.cache_data(ttl=900)
 def fetch_nse_index_fundamentals():
-    """Scrapes live index P/E, P/B, and Dividend Yield from NSE India APIs."""
+    """Scrapes live index P/E, P/B, and Dividend Yield directly from NSE."""
     results = []
+    if not NSEPYTHON_AVAILABLE:
+        st.warning("nsepython package is currently building on the server. Please wait or click Force Refresh.")
+        return pd.DataFrame()
+
     try:
         all_indices = nse_get_all_indices()
-        df_all = pd.DataFrame(all_indices['data']) if 'data' in all_indices else pd.DataFrame()
+        df_all = pd.DataFrame(all_indices['data']) if isinstance(all_indices, dict) and 'data' in all_indices else pd.DataFrame()
         
         for name, nse_symbol in INDEX_TICKERS.items():
             try:
-                # Direct NSE P/E API via nsepython
                 pe_df = index_pe_pb(
                     symbol=nse_symbol,
                     start_date=(dt.date.today() - dt.timedelta(days=7)).strftime("%d-%b-%Y"),
                     end_date=dt.date.today().strftime("%d-%b-%Y")
                 )
-                pe_val = pe_df['pe'].iloc[-1] if not pe_df.empty and 'pe' in pe_df.columns else "N/A"
-                pb_val = pe_df['pb'].iloc[-1] if not pe_df.empty and 'pb' in pe_df.columns else "N/A"
-                div_val = pe_df['divYield'].iloc[-1] if not pe_df.empty and 'divYield' in pe_df.columns else "N/A"
+                pe_val = pe_df['pe'].iloc[-1] if isinstance(pe_df, pd.DataFrame) and not pe_df.empty and 'pe' in pe_df.columns else "N/A"
+                pb_val = pe_df['pb'].iloc[-1] if isinstance(pe_df, pd.DataFrame) and not pe_df.empty and 'pb' in pe_df.columns else "N/A"
+                div_val = pe_df['divYield'].iloc[-1] if isinstance(pe_df, pd.DataFrame) and not pe_df.empty and 'divYield' in pe_df.columns else "N/A"
                 
                 curr_level = "N/A"
                 if not df_all.empty and 'indexSymbol' in df_all.columns:
@@ -176,10 +139,10 @@ def fetch_nse_index_fundamentals():
         st.error(f"Error scraping NSE Indices: {e}")
         return pd.DataFrame()
 
-# ----------------------------------------------------------------- Direct API Macro Scrapers
+# ----------------------------------------------------------------- Macro Data Handlers
 @st.cache_data(ttl=1800)
 def fetch_direct_macro_rate(symbol_code):
-    """Scrapes global macro instruments directly using public financial web endpoints."""
+    """Fetches global financial rate series directly via HTTP."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol_code}?interval=1wk&range=6mo"
     req_headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -196,7 +159,7 @@ def fetch_direct_macro_rate(symbol_code):
     except Exception:
         return None
 
-# ----------------------------------------------------------------- Main Dashboard UI
+# ----------------------------------------------------------------- Main Dashboard
 def run_app():
     st.title("📈 Pure NSE Market & Macro Economic Dashboard")
     st.caption("All Indian equity and index metrics are scraped directly from NSE India REST APIs.")
@@ -226,12 +189,7 @@ def run_app():
 
     # --- TAB 1: DB STOCK MOVERS DATA ---
     with t1:
-        st.header("Daily & Weekly Stock Movers (NSE Scraping)")
-        if st.button("🔄 Scrape Latest Equities from NSE"):
-            with st.spinner("Scraping price history from NSE India..."):
-                refresh_nse_prices(con)
-                st.rerun()
-
+        st.header("Daily & Weekly Stock Movers")
         try:
             df_daily = pd.read_sql("SELECT * FROM daily_movers", con)
             df_weekly = pd.read_sql("SELECT * FROM weekly_movers", con)
@@ -254,9 +212,9 @@ def run_app():
                 st.subheader("Top Weekly Losers (%)")
                 st.dataframe(df_weekly.sort_values(by="week_change_pct", ascending=True).head(15), use_container_width=True)
         except Exception:
-            st.info("No stock data found in local DB. Click 'Scrape Latest Equities from NSE' above.")
+            st.info("No stock data found in local DB.")
 
-    # --- TAB 2: INDEX FUNDAMENTALS (SCRAPED DIRECTLY FROM NSE) ---
+    # --- TAB 2: INDEX FUNDAMENTALS ---
     with t2:
         st.header("Nifty Indices Fundamental Valuation (NSE Live API)")
         st.caption("Live P/E ratios, P/B ratios, and Dividend Yields fetched directly from National Stock Exchange servers.")
@@ -265,10 +223,8 @@ def run_app():
             df_idx_fundamentals = fetch_nse_index_fundamentals()
             if not df_idx_fundamentals.empty:
                 st.dataframe(df_idx_fundamentals, use_container_width=True)
-            else:
-                st.warning("NSE India website is currently rate-limiting request attempts. Please click Force Refresh.")
 
-    # --- TAB 3: INDIAN INFLATION (CPI) ---
+    # --- TAB 3: INDIAN INFLATION ---
     with t3:
         st.header("Indian Retail Inflation Dynamics (CPI YoY %)")
         today = dt.date.today()
@@ -283,7 +239,7 @@ def run_app():
 
     # --- TAB 4: GOLD, SILVER & COPPER ---
     with t4:
-        st.header("International Commodities (Weekly Live Rates)")
+        st.header("International Commodities (Weekly Rates)")
         col_g, col_s, col_c = st.columns(3)
         with col_g:
             st.subheader("🥇 Gold Futures")
@@ -298,7 +254,7 @@ def run_app():
             df_copper = fetch_direct_macro_rate("HG=F")
             st.dataframe(df_copper if df_copper is not None else pd.DataFrame(), use_container_width=True)
 
-    # --- TAB 5: DOLLAR INDEX (DXY) ---
+    # --- TAB 5: DOLLAR INDEX ---
     with t5:
         st.header("US Dollar Index (DXY) Weekly Tracker")
         df_dxy = fetch_direct_macro_rate("DX-Y.NY")
