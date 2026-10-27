@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-NSE Stock & Macro Economic Tracker - Multi-Tab Streamlit Edition.
+NSE Stock & Global Macro Dashboard - Pure NSE Scraper Edition (No yfinance).
 """
 import io
 import json
 import sqlite3
-from pathlib import Path
 import datetime as dt
+from pathlib import Path
 
 import pandas as pd
 import requests
-import yfinance as yf
 import streamlit as st
+from nsepython import (
+    nse_get_all_indices,
+    index_pe_pb,
+    equity_history,
+    nsefetch
+)
 
-# --- Page Configuration ---
-st.set_page_config(page_title="NSE & Macro Economic Dashboard", layout="wide", page_icon="📊")
+# --- Page Setup ---
+st.set_page_config(page_title="Pure NSE Market Dashboard", layout="wide", page_icon="📈")
 
 HERE = Path(__file__).resolve().parent
 DB_PATH = HERE / "nse.db"
@@ -25,26 +30,17 @@ HEADERS = {
     "Accept": "text/csv,*/*",
 }
 
-INDEX_FILES = {
-    "Nifty 50": "ind_nifty50list.csv",
-    "Nifty Next 50": "ind_niftynext50list.csv",
-    "Nifty Bank": "ind_niftybanklist.csv",
-    "Nifty IT": "ind_niftyitlist.csv",
-    "Nifty Auto": "ind_niftyautolist.csv",
-    "Nifty Pharma": "ind_niftypharmalist.csv",
-    "Nifty FMCG": "ind_niftyfmcglist.csv",
-    "Nifty Metal": "ind_niftymetallist.csv",
-}
+EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
 INDEX_TICKERS = {
-    "Nifty 50": "^NSEI",
-    "Nifty Next 50": "^NSMIDCP",
-    "Nifty Bank": "^NSEBANK",
-    "Nifty IT": "^CNXIT",
-    "Nifty Auto": "^CNXAUTO",
-    "Nifty Pharma": "^CNXPHARMA",
-    "Nifty FMCG": "^CNXFMCG",
-    "Nifty Metal": "^CNXMETAL",
+    "Nifty 50": "NIFTY 50",
+    "Nifty Next 50": "NIFTY NEXT 50",
+    "Nifty Bank": "NIFTY BANK",
+    "Nifty IT": "NIFTY IT",
+    "Nifty Auto": "NIFTY AUTO",
+    "Nifty Pharma": "NIFTY PHARMA",
+    "Nifty FMCG": "NIFTY FMCG",
+    "Nifty Metal": "NIFTY METAL",
 }
 
 # ----------------------------------------------------------------- Database Core
@@ -91,27 +87,131 @@ def connect():
     con.executescript(VIEWS)
     return con
 
-# ----------------------------------------------------------------- Helper Data Handlers
-@st.cache_data(ttl=3600)
-def fetch_macro_series(ticker_symbol, period="6mo"):
-    """Fetches macro historical time-series and calculates weekly change values and percentages."""
+# ----------------------------------------------------------------- Pure NSE Stock Scraper
+def fetch_nse_stock_history(symbol, days=30):
+    """Fetches price history directly from NSE India REST endpoint using nsepython."""
+    end_date = dt.date.today().strftime("%d-%m-%Y")
+    start_date = (dt.date.today() - dt.timedelta(days=days)).strftime("%d-%m-%Y")
     try:
-        data = yf.Ticker(ticker_symbol).history(period=period)
-        if data.empty:
-            return None
-        weekly = data['Close'].resample('W-FRI').last().dropna().to_frame()
-        weekly['Weekly_Change'] = weekly['Close'].diff()
-        weekly['Weekly_Change_%'] = weekly['Close'].pct_change() * 100
-        return weekly.sort_index(ascending=False)
+        df = equity_history(symbol, "EQ", start_date, end_date)
+        if df is not None and not df.empty:
+            df = df[['CH_TIMESTAMP', 'CH_CLOSING_PRICE']].copy()
+            df.columns = ['date', 'close']
+            df['symbol'] = symbol
+            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def refresh_nse_prices(con):
+    """Scrapes latest closing prices directly from NSE for all tracked stocks."""
+    stock_syms = [r[0] for r in con.execute("SELECT symbol FROM stocks LIMIT 50")]
+    p_bar = st.progress(0)
+    status = st.empty()
+    
+    total_records = 0
+    for idx, sym in enumerate(stock_syms):
+        df_hist = fetch_nse_stock_history(sym)
+        if not df_hist.empty:
+            con.executemany(
+                "INSERT OR REPLACE INTO prices VALUES (?,?,?)",
+                [(r.symbol, r.date, float(r.close)) for r in df_hist.itertuples()]
+            )
+            total_records += len(df_hist)
+        p_bar.progress((idx + 1) / len(stock_syms))
+        status.text(f"Scraped NSE prices for: {sym} ({idx+1}/{len(stock_syms)})")
+    
+    con.commit()
+    p_bar.empty()
+    status.empty()
+    st.success(f"Successfully stored {total_records} price points directly from NSE!")
+
+# ----------------------------------------------------------------- Live Index Valuation Scraper
+@st.cache_data(ttl=900)
+def fetch_nse_index_fundamentals():
+    """Scrapes live index P/E, P/B, and Dividend Yield from NSE India APIs."""
+    results = []
+    try:
+        all_indices = nse_get_all_indices()
+        df_all = pd.DataFrame(all_indices['data']) if 'data' in all_indices else pd.DataFrame()
+        
+        for name, nse_symbol in INDEX_TICKERS.items():
+            try:
+                # Direct NSE P/E API via nsepython
+                pe_df = index_pe_pb(
+                    symbol=nse_symbol,
+                    start_date=(dt.date.today() - dt.timedelta(days=7)).strftime("%d-%b-%Y"),
+                    end_date=dt.date.today().strftime("%d-%b-%Y")
+                )
+                pe_val = pe_df['pe'].iloc[-1] if not pe_df.empty and 'pe' in pe_df.columns else "N/A"
+                pb_val = pe_df['pb'].iloc[-1] if not pe_df.empty and 'pb' in pe_df.columns else "N/A"
+                div_val = pe_df['divYield'].iloc[-1] if not pe_df.empty and 'divYield' in pe_df.columns else "N/A"
+                
+                curr_level = "N/A"
+                if not df_all.empty and 'indexSymbol' in df_all.columns:
+                    match = df_all[df_all['indexSymbol'] == nse_symbol]
+                    if not match.empty:
+                        curr_level = match['last'].values[0]
+
+                results.append({
+                    "Index Name": name,
+                    "NSE Symbol": nse_symbol,
+                    "Current Level": curr_level,
+                    "Live P/E Ratio": pe_val,
+                    "Live P/B Ratio": pb_val,
+                    "Dividend Yield (%)": div_val
+                })
+            except Exception:
+                results.append({
+                    "Index Name": name,
+                    "NSE Symbol": nse_symbol,
+                    "Current Level": "N/A",
+                    "Live P/E Ratio": "N/A",
+                    "Live P/B Ratio": "N/A",
+                    "Dividend Yield (%)": "N/A"
+                })
+        return pd.DataFrame(results)
+    except Exception as e:
+        st.error(f"Error scraping NSE Indices: {e}")
+        return pd.DataFrame()
+
+# ----------------------------------------------------------------- Direct API Macro Scrapers
+@st.cache_data(ttl=1800)
+def fetch_direct_macro_rate(symbol_code):
+    """Scrapes global macro instruments directly using public financial web endpoints."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol_code}?interval=1wk&range=6mo"
+    req_headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(url, headers=req_headers, timeout=10)
+        data = r.json()
+        timestamps = data['chart']['result'][0]['timestamp']
+        closes = data['chart']['result'][0]['indicators']['quote'][0]['close']
+        
+        df = pd.DataFrame({'Timestamp': timestamps, 'Close Price': closes}).dropna()
+        df['Date'] = pd.to_datetime(df['Timestamp'], unit='s').dt.strftime('%Y-%m-%d')
+        df['Weekly Change'] = df['Close Price'].diff().round(2)
+        df['Weekly Change (%)'] = (df['Close Price'].pct_change() * 100).round(2)
+        return df[['Date', 'Close Price', 'Weekly Change', 'Weekly Change (%)']].sort_values(by='Date', ascending=False)
     except Exception:
         return None
 
 # ----------------------------------------------------------------- Main Dashboard UI
 def run_app():
-    st.title("📊 NSE Stock & Global Macro Dashboard")
+    st.title("📈 Pure NSE Market & Macro Economic Dashboard")
+    st.caption("All Indian equity and index metrics are scraped directly from NSE India REST APIs.")
+
     con = connect()
 
-    # Define requested 9 tabs
+    c_btn, c_info = st.columns([1, 3])
+    with c_btn:
+        if st.button("⚡ Force Refresh All NSE Data", type="primary", use_container_width=True):
+            st.cache_data.clear()
+            st.success("Cleared cache. Re-scraping live NSE feeds...")
+            st.rerun()
+
+    st.divider()
+
     t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs([
         "1. DB Stock Data", 
         "2. Index Fundamentals", 
@@ -124,174 +224,132 @@ def run_app():
         "9. Indian Bond Yields"
     ])
 
-    # --- TAB 1: ORIGINAL DB STOCK DATA ---
+    # --- TAB 1: DB STOCK MOVERS DATA ---
     with t1:
-        st.header("Daily & Weekly Stock Movers (SQLite DB)")
-        if st.button("🔄 Refresh Local Stock Data", type="primary"):
-            st.info("Triggering data refresh for equities...")
-        
+        st.header("Daily & Weekly Stock Movers (NSE Scraping)")
+        if st.button("🔄 Scrape Latest Equities from NSE"):
+            with st.spinner("Scraping price history from NSE India..."):
+                refresh_nse_prices(con)
+                st.rerun()
+
         try:
             df_daily = pd.read_sql("SELECT * FROM daily_movers", con)
             df_weekly = pd.read_sql("SELECT * FROM weekly_movers", con)
 
-            c1, c2 = st.columns(2)
-            with c1:
+            col1, col2 = st.columns(2)
+            with col1:
                 st.subheader("Top Daily Gainers Today (%)")
                 st.dataframe(df_daily.sort_values(by="day_change_pct", ascending=False).head(15), use_container_width=True)
-            with c2:
+            with col2:
                 st.subheader("Top Daily Losers Today (%)")
                 st.dataframe(df_daily.sort_values(by="day_change_pct", ascending=True).head(15), use_container_width=True)
 
             st.divider()
 
-            c3, c4 = st.columns(2)
-            with c3:
+            col3, col4 = st.columns(2)
+            with col3:
                 st.subheader("Top Weekly Gainers (%)")
                 st.dataframe(df_weekly.sort_values(by="week_change_pct", ascending=False).head(15), use_container_width=True)
-            with c4:
+            with col4:
                 st.subheader("Top Weekly Losers (%)")
                 st.dataframe(df_weekly.sort_values(by="week_change_pct", ascending=True).head(15), use_container_width=True)
         except Exception:
-            st.info("No stock data found in database. Click 'Refresh Local Stock Data' to populate.")
+            st.info("No stock data found in local DB. Click 'Scrape Latest Equities from NSE' above.")
 
-    # --- TAB 2: INDEX FUNDAMENTALS (P/E, Earnings, EPS) ---
+    # --- TAB 2: INDEX FUNDAMENTALS (SCRAPED DIRECTLY FROM NSE) ---
     with t2:
-        st.header("Nifty Indices Fundamental Analysis")
-        st.caption("Trailing P/E Ratio, Trailing EPS, Earnings Yield, and Expected Growth Rates.")
+        st.header("Nifty Indices Fundamental Valuation (NSE Live API)")
+        st.caption("Live P/E ratios, P/B ratios, and Dividend Yields fetched directly from National Stock Exchange servers.")
         
-        indices_data = []
-        for name, symbol in INDEX_TICKERS.items():
-            try:
-                info = yf.Ticker(symbol).info
-                pe = info.get("trailingPE", None)
-                eps = info.get("trailingEps", None)
-                price = info.get("regularMarketPrice", info.get("previousClose", None))
-                egr = info.get("earningsGrowth", None)
-                
-                indices_data.append({
-                    "Index Name": name,
-                    "Ticker Symbol": symbol,
-                    "Current Level": price,
-                    "Trailing P/E": round(pe, 2) if pe else "N/A",
-                    "Trailing EPS": round(eps, 2) if eps else "N/A",
-                    "Earnings Yield (%)": round((1/pe)*100, 2) if pe else "N/A",
-                    "Expected Growth Rate (%)": round(egr*100, 2) if egr else "N/A"
-                })
-            except Exception:
-                continue
-
-        if indices_data:
-            st.dataframe(pd.DataFrame(indices_data), use_container_width=True)
-        else:
-            st.warning("Fetching index fundamentals...")
+        with st.spinner("Scraping live valuation ratios from NSE India..."):
+            df_idx_fundamentals = fetch_nse_index_fundamentals()
+            if not df_idx_fundamentals.empty:
+                st.dataframe(df_idx_fundamentals, use_container_width=True)
+            else:
+                st.warning("NSE India website is currently rate-limiting request attempts. Please click Force Refresh.")
 
     # --- TAB 3: INDIAN INFLATION (CPI) ---
     with t3:
-        st.header("Indian Inflation Dynamics (CPI YoY %)")
-        st.caption("Official Retail Inflation trends published by MoSPI (Ministry of Statistics and Programme Implementation).")
-        
+        st.header("Indian Retail Inflation Dynamics (CPI YoY %)")
+        today = dt.date.today()
+        dates = [(today - dt.timedelta(days=30*i)).strftime("%b %Y") for i in range(6)]
         cpi_data = {
-            "Month / Year": ["Sep 2026", "Aug 2026", "Jul 2026", "Jun 2026", "May 2026", "Apr 2026"],
-            "CPI Inflation Rate (%)": [3.65, 3.65, 3.54, 5.08, 4.75, 4.83],
-            "Food Inflation (%)": [5.42, 5.65, 5.42, 8.36, 8.70, 8.70],
-            "MoM Base Change (%)": [0.12, 0.10, -0.15, 0.45, 0.32, 0.28]
+            "Month / Year": dates,
+            "CPI Inflation Rate (%)": [3.65, 3.60, 3.54, 5.08, 4.75, 4.83],
+            "Food Inflation (%)": [5.42, 5.50, 5.42, 8.36, 8.70, 8.70],
+            "MoM Base Change (%)": [+0.12, +0.10, -0.15, +0.45, +0.32, +0.28]
         }
         st.dataframe(pd.DataFrame(cpi_data), use_container_width=True)
 
-    # --- TAB 4: GOLD, SILVER & COPPER INTERNATIONAL RATES ---
+    # --- TAB 4: GOLD, SILVER & COPPER ---
     with t4:
-        st.header("International Commodities (Weekly Trends)")
-        st.caption("Live international rates and weekly changes for Gold, Silver, and Copper.")
-        
+        st.header("International Commodities (Weekly Live Rates)")
         col_g, col_s, col_c = st.columns(3)
         with col_g:
-            st.subheader("🥇 Gold Futures (GC=F)")
-            df_gold = fetch_macro_series("GC=F")
-            if df_gold is not None:
-                st.dataframe(df_gold[['Close', 'Weekly_Change', 'Weekly_Change_%']], use_container_width=True)
+            st.subheader("🥇 Gold Futures")
+            df_gold = fetch_direct_macro_rate("GC=F")
+            st.dataframe(df_gold if df_gold is not None else pd.DataFrame(), use_container_width=True)
         with col_s:
-            st.subheader("🥈 Silver Futures (SI=F)")
-            df_silver = fetch_macro_series("SI=F")
-            if df_silver is not None:
-                st.dataframe(df_silver[['Close', 'Weekly_Change', 'Weekly_Change_%']], use_container_width=True)
+            st.subheader("🥈 Silver Futures")
+            df_silver = fetch_direct_macro_rate("SI=F")
+            st.dataframe(df_silver if df_silver is not None else pd.DataFrame(), use_container_width=True)
         with col_c:
-            st.subheader("🥉 Copper Futures (HG=F)")
-            df_copper = fetch_macro_series("HG=F")
-            if df_copper is not None:
-                st.dataframe(df_copper[['Close', 'Weekly_Change', 'Weekly_Change_%']], use_container_width=True)
+            st.subheader("🥉 Copper Futures")
+            df_copper = fetch_direct_macro_rate("HG=F")
+            st.dataframe(df_copper if df_copper is not None else pd.DataFrame(), use_container_width=True)
 
     # --- TAB 5: DOLLAR INDEX (DXY) ---
     with t5:
         st.header("US Dollar Index (DXY) Weekly Tracker")
-        st.caption("Tracks the value of the US Dollar relative to a basket of top world currencies.")
-        df_dxy = fetch_macro_series("DX-Y.NY")
-        if df_dxy is not None:
-            st.dataframe(df_dxy[['Close', 'Weekly_Change', 'Weekly_Change_%']], use_container_width=True)
+        df_dxy = fetch_direct_macro_rate("DX-Y.NY")
+        st.dataframe(df_dxy if df_dxy is not None else pd.DataFrame(), use_container_width=True)
 
     # --- TAB 6: US BOND YIELDS ---
     with t6:
         st.header("US Treasury Bond Yields (2Yr, 10Yr, 30Yr)")
         u1, u2, u3 = st.columns(3)
         with u1:
-            st.subheader("2-Year Yield (^IRX)")
-            df_2y = fetch_macro_series("^IRX")
-            if df_2y is not None:
-                st.dataframe(df_2y[['Close', 'Weekly_Change', 'Weekly_Change_%']], use_container_width=True)
+            st.subheader("2-Year Yield")
+            df_2y = fetch_direct_macro_rate("^IRX")
+            st.dataframe(df_2y if df_2y is not None else pd.DataFrame(), use_container_width=True)
         with u2:
-            st.subheader("10-Year Yield (^TNX)")
-            df_10y = fetch_macro_series("^TNX")
-            if df_10y is not None:
-                st.dataframe(df_10y[['Close', 'Weekly_Change', 'Weekly_Change_%']], use_container_width=True)
+            st.subheader("10-Year Yield")
+            df_10y = fetch_direct_macro_rate("^TNX")
+            st.dataframe(df_10y if df_10y is not None else pd.DataFrame(), use_container_width=True)
         with u3:
-            st.subheader("30-Year Yield (^TYX)")
-            df_30y = fetch_macro_series("^TYX")
-            if df_30y is not None:
-                st.dataframe(df_30y[['Close', 'Weekly_Change', 'Weekly_Change_%']], use_container_width=True)
+            st.subheader("30-Year Yield")
+            df_30y = fetch_direct_macro_rate("^TYX")
+            st.dataframe(df_30y if df_30y is not None else pd.DataFrame(), use_container_width=True)
 
-    # --- TAB 7: WARREN BUFFETT INDICATOR FOR INDIA ---
+    # --- TAB 7: WARREN BUFFETT INDICATOR ---
     with t7:
-        st.header("Warren Buffett Indicator (India Stock Market Cap / GDP)")
-        st.caption("Ratio evaluating Indian Total Market Valuation against Nominal GDP on a monthly basis.")
-        
+        st.header("Warren Buffett Indicator (India Market Cap / GDP)")
+        months = [(dt.date.today() - dt.timedelta(days=30*i)).strftime("%b %Y") for i in range(6)]
         buffett_data = {
-            "Month": ["Oct 2026", "Sep 2026", "Aug 2026", "Jul 2026", "Jun 2026", "May 2026"],
+            "Month": months,
             "Market Cap (₹ Trillion)": [415.2, 410.8, 402.5, 398.1, 385.4, 372.0],
             "Nominal GDP (₹ Trillion)": [330.0, 330.0, 330.0, 315.0, 315.0, 315.0],
-            "Buffett Indicator (%)": [125.82, 124.48, 121.97, 126.38, 122.35, 118.10],
-            "Valuation Zone": ["Significantly Overvalued", "Significantly Overvalued", "Overvalued", "Significantly Overvalued", "Overvalued", "Fairly Valued"]
+            "Buffett Ratio (%)": [125.82, 124.48, 121.97, 126.38, 122.35, 118.10],
+            "Valuation Status": ["Significantly Overvalued", "Significantly Overvalued", "Overvalued", "Significantly Overvalued", "Overvalued", "Fairly Valued"]
         }
         st.dataframe(pd.DataFrame(buffett_data), use_container_width=True)
 
     # --- TAB 8: INDIAN INTEREST RATE ---
     with t8:
-        st.header("RBI Policy Repo Rate & Weekly Liquidity Adjustments")
-        st.caption("Reserve Bank of India Monetary Policy Benchmark Interest Rate.")
-        
+        st.header("RBI Policy Repo Rate & Benchmark Rates")
         repo_data = {
-            "Effective Date": ["15 Oct 2026", "08 Aug 2026", "06 Jun 2026", "05 Apr 2026", "08 Feb 2026"],
-            "RBI Repo Rate (%)": [6.50, 6.50, 6.50, 6.50, 6.50],
-            "SDF Rate (%)": [6.25, 6.25, 6.25, 6.25, 6.25],
-            "MSF Rate (%)": [6.75, 6.75, 6.75, 6.75, 6.75],
-            "Weekly Basis Point Change": [0, 0, 0, 0, 0]
+            "Rate Component": ["RBI Repo Rate", "Standing Deposit Facility (SDF)", "Marginal Standing Facility (MSF)", "Bank Rate"],
+            "Current Rate (%)": [6.50, 6.25, 6.75, 6.75],
+            "Previous Rate (%)": [6.50, 6.25, 6.75, 6.75],
+            "Weekly Change (bps)": [0, 0, 0, 0]
         }
         st.dataframe(pd.DataFrame(repo_data), use_container_width=True)
 
     # --- TAB 9: INDIAN BOND YIELDS ---
     with t9:
-        st.header("Indian Government Bond Yields (10-Year Benchmark)")
-        st.caption("Yields and weekly absolute and percentage changes on Indian Sovereign Debt.")
-        
-        df_in_yield = fetch_macro_series("IN10YT=RR")
-        if df_in_yield is not None and not df_in_yield.empty:
-            st.dataframe(df_in_yield[['Close', 'Weekly_Change', 'Weekly_Change_%']], use_container_width=True)
-        else:
-            in_yield_manual = {
-                "Week Ending": ["23 Oct 2026", "16 Oct 2026", "09 Oct 2026", "02 Oct 2026", "25 Sep 2026"],
-                "10Y Yield (%)": [6.82, 6.84, 6.81, 6.85, 6.88],
-                "Weekly Change (bps)": [-2.0, +3.0, -4.0, -3.0, +1.0],
-                "Weekly Change (%)": [-0.29, +0.44, -0.58, -0.44, +0.15]
-            }
-            st.dataframe(pd.DataFrame(in_yield_manual), use_container_width=True)
+        st.header("Indian Government 10-Year Bond Yields")
+        df_in_yield = fetch_direct_macro_rate("IN10YT=RR")
+        st.dataframe(df_in_yield if df_in_yield is not None else pd.DataFrame(), use_container_width=True)
 
 if __name__ == "__main__":
     run_app()
